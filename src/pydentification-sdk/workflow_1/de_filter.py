@@ -1,0 +1,2 @@
+class DEFilter:
+    pass

@@ -1,0 +1,13 @@
+[project]
+name = "target-pydentification"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.3.1",
+    "pandas>=2.3.1",
+    "requests>=2.32.4",
+    "tqdm>=4.67.1",
+    "transformers>=4.53.2",
+]
