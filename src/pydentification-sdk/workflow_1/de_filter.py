@@ -1,88 +1,98 @@
 import os
+import time
+import json
 import torch
+import random
 import logging
-from transformers import pipeline
+import requests
+from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.exceptions import RequestException
 
+# Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 class PhenotypeInferencer:
-    def __init__(self, use_gpu=True, max_workers=None, labels=None, verbose=True):
-        self.device = 0 if use_gpu and torch.cuda.is_available() else -1
-        self.max_workers = max_workers or os.cpu_count()
-        self.labels = labels or ["control", "diseased", "unknown"]
+    def __init__(
+        self,
+        api_url: str,
+        api_key: str,
+        deployment_id: str,
+        api_version: str = "2024-02-15-preview",
+        max_workers: int = 4,
+        max_retries: int = 5,
+        base_delay: float = 1.0,
+        verbose: bool = True,
+    ):
+        self.api_url = f"{api_url}/openai/deployments/{deployment_id}/chat/completions?api-version={api_version}"
+        self.headers = {
+            "Content-Type": "application/json",
+            "api-key": api_key
+        }
+        self.max_workers = max_workers
+        self.max_retries = max_retries
+        self.base_delay = base_delay
         self.verbose = verbose
 
+    def _log(self, msg):
         if self.verbose:
-            logging.info(f"Using device: {'cuda' if self.device == 0 else 'cpu'}")
-            logging.info(f"Max workers: {self.max_workers}")
+            logging.info(msg)
 
-        model_name = (
-            "facebook/bart-large-mnli" if self.device == 0
-            else "MoritzLaurer/deberta-v3-base-zeroshot-v1"
+    def _infer_single_sample(self, sample: Dict) -> Dict:
+        """Send a single sample to the OpenAI model and return result with inference."""
+        prompt = (
+            "Classify the given sample into one of the two categories only: 'control' or 'diseased'.\n\n"
+            f"Sample:\n{json.dumps(sample, indent=2)}\n\n"
+            "Response should be only one word: 'control' or 'diseased'."
         )
 
-        if self.verbose:
-            logging.info(f"Using model: {model_name}")
+        body = {
+            "messages": [
+                {"role": "system", "content": "You are a biomedical AI model trained to classify samples."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0,
+            "top_p": 1,
+            "n": 1
+        }
 
-        self.classifier = pipeline(
-            "zero-shot-classification",
-            model=model_name,
-            device=self.device
-        )
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(self.api_url, headers=self.headers, json=body)
+                if response.status_code == 200:
+                    reply = response.json()["choices"][0]["message"]["content"].strip().lower()
+                    sample["phenotype_inference"] = reply
+                    return sample
+                elif response.status_code == 429:
+                    delay = self.base_delay * (2 ** attempt) + random.uniform(0.1, 0.5)
+                    self._log(f"Rate limited (429). Retry {attempt + 1}/{self.max_retries} in {delay:.2f}s.")
+                    time.sleep(delay)
+                elif response.status_code >= 500:
+                    delay = self.base_delay * (2 ** attempt) + random.uniform(0.1, 0.5)
+                    self._log(f"Server error {response.status_code}. Retry {attempt + 1}/{self.max_retries} in {delay:.2f}s.")
+                    time.sleep(delay)
+                else:
+                    self._log(f"Request failed with status {response.status_code}: {response.text}")
+                    sample["phenotype_inference"] = "error"
+                    return sample
+            except RequestException as e:
+                self._log(f"Request error: {e}. Retrying...")
+                time.sleep(self.base_delay + random.uniform(0, 0.5))
 
-    def _construct_metadata_text(self, gsm):
-        metadata_text = []
-        for key, value in gsm.metadata.items():
-            if isinstance(value, list):
-                metadata_text.append(" ".join(value))
-            elif isinstance(value, str):
-                metadata_text.append(value)
-        final_text = " ".join(metadata_text).strip()
-        if self.verbose:
-            logging.info(f"Metadata for {gsm.name[:10]}...: {final_text[:80]}...")
-        return final_text
+        sample["phenotype_inference"] = "error"
+        return sample
 
-    def _classify_sample(self, gsm_name, gsm):
-        metadata_text = self._construct_metadata_text(gsm)
+    def run(self, samples: List[Dict]) -> List[Dict]:
+        """Run phenotype inference on a list of samples using multithreading and safe retry."""
+        self._log(f"Starting inference on {len(samples)} samples using {self.max_workers} workers.")
 
-        if not metadata_text:
-            if self.verbose:
-                logging.warning(f"No metadata for {gsm_name}")
-            return gsm_name, {"label": "unknown", "score": 0.0}
-
-        try:
-            result = self.classifier(metadata_text, self.labels)
-            label = result["labels"][0]
-            score = result["scores"][0]
-            if self.verbose:
-                logging.info(f"Classified {gsm_name}: {label} ({score:.2f})")
-            return gsm_name, {"label": label, "score": score}
-        except Exception as e:
-            logging.error(f"Error classifying {gsm_name}: {e}")
-            return gsm_name, {"label": "unknown", "score": 0.0}
-
-    def infer(self, gse):
-        phenotype_map = {}
-        gsm_entries = list(gse.gsms.items())
-
-        if self.verbose:
-            logging.info(f"Starting classification for {len(gsm_entries)} samples...")
-
+        results = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {
-                executor.submit(self._classify_sample, gsm_name, gsm): gsm_name
-                for gsm_name, gsm in gsm_entries
-            }
+            future_to_sample = {executor.submit(self._infer_single_sample, sample): sample for sample in samples}
 
-            for future in as_completed(futures):
-                gsm_id, result = future.result()
-                phenotype_map[gsm_id] = result
+            for future in as_completed(future_to_sample):
+                result = future.result()
+                results.append(result)
 
-        if self.verbose:
-            label_counts = {label: sum(1 for x in phenotype_map.values() if x["label"] == label) for label in self.labels}
-            logging.info("Classification complete. Summary:")
-            for label, count in label_counts.items():
-                logging.info(f" - {label}: {count}")
-
-        return phenotype_map
+        self._log("Inference completed.")
+        return results
