@@ -4,7 +4,7 @@ import GEOparse
 from pathlib import Path
 from typing import Optional
 import time
-
+import pandas as pd
 
 class DifferentialExpressionDataDownloader:
     @staticmethod
@@ -121,3 +121,31 @@ class DifferentialExpressionDataDownloader:
                 'exists': True
             }
         return None
+    
+    @staticmethod
+    def get_expression_matrix(gse):
+        """
+        Constructs a gene expression matrix from GSM tables in the GSE object.
+        Rows = gene identifiers, Columns = sample GSM IDs.
+        """
+        gene_expr = {}
+
+        for gsm_id, gsm in gse.gsms.items():
+            table = gsm.table
+            if table is None or table.empty:
+                continue
+
+            try:
+                genes = table.iloc[:, 0].astype(str)
+                values = pd.to_numeric(table.iloc[:, 1], errors="coerce")
+                gene_expr[gsm_id] = pd.Series(values.values, index=genes)
+            except Exception as e:
+                print(f"Skipping {gsm_id} due to parsing error: {e}")
+                continue
+
+        if not gene_expr:
+            raise ValueError("No valid expression tables found in GSE object.")
+
+        expr_df = pd.DataFrame(gene_expr)
+        expr_df = expr_df.dropna()
+        return expr_df

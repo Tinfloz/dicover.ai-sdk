@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 class PhenotypeInferencer:
     def __init__(self, max_workers=5):
-        self.api_url = os.getenv["API_URL"]
-        self.api_key = os.getenv["API_KEY_GPT"]
-        self.deployment_id = os.getenv["DEPLOYMENT_ID"]
+        self.api_url = os.getenv("API_URL")
+        self.api_key = os.getenv("API_KEY_GPT")
+        self.deployment_id = os.getenv("DEPLOYMENT_ID")
         self.max_workers = max_workers
 
     def inspect_sample_metadata(self, sample):
